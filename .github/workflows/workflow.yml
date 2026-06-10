@@ -39,7 +39,7 @@ jobs:
     runs-on: windows-latest
     outputs:
       filename: ${{ steps.set_filename.outputs.filename }}
-      isoname: ${{ steps.get_iso.outputs.filename }}
+      isoname: ${{ steps.get_iso.outputs.isoname }}
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
@@ -49,6 +49,7 @@ jobs:
       - name: Download ZIP file using PowerShell
         id: set_filename
         run: |
+          New-Item -ItemType Directory -Path .\debug-response -Force | Out-Null
           # set default for test runs
           $url = "${{ github.event.inputs.uup_build_url }}"      
           if (-not $url) {
@@ -60,55 +61,116 @@ jobs:
           $url = $url -replace "download.php", "get.php"
           Write-Output $url
           $body = "autodl=2&updates=1"
-          $response = Invoke-WebRequest -Uri $url -Method POST -Body $body -ContentType "application/x-www-form-urlencoded"
-          Write-Output "Web request response:"
-          Write-Output $response
-          "Web request response:" >> $GITHUB_STEP_SUMMARY
-          $response >> $GITHUB_STEP_SUMMARY
+          @"
+          URL: $url
+          Method: POST
+          Body: $body
+          Content-Type: application/x-www-form-urlencoded
+          "@ | Set-Content -Path .\debug-response\request.txt
+          $response = Invoke-WebRequest -Uri $url -Method POST -Body $body -ContentType "application/x-www-form-urlencoded" -SkipHttpErrorCheck
+          Write-Output "Web request status: $($response.StatusCode) $($response.StatusDescription)"
+          "Web request status: $($response.StatusCode) $($response.StatusDescription)" >> $GITHUB_STEP_SUMMARY
+          "Status: $($response.StatusCode) $($response.StatusDescription)" | Set-Content -Path .\debug-response\response-status.txt
+          $response.Headers | ConvertTo-Json -Depth 5 | Set-Content -Path .\debug-response\response-headers.json
+          $response | Select-Object StatusCode, StatusDescription, RawContentLength, Headers | Format-List | Out-String | Set-Content -Path .\debug-response\response-metadata.txt
+          if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+            $response.Content | Set-Content -Path .\debug-response\response-body.txt
+            throw "UUP dump request failed with HTTP $($response.StatusCode) $($response.StatusDescription). See the uup-response-debug artifact."
+          }
           # Get Filename from response header
           $header = $response.Headers.'Content-Disposition'
+          if (-not $header) {
+            throw "UUP dump response did not include a Content-Disposition header."
+          }
           Write-Output $header
           $header >> $GITHUB_STEP_SUMMARY
-          $filename = ($header.Split('filename=')[-1]).Trim('"')
+          $header | Set-Content -Path .\debug-response\content-disposition.txt
+          $filename_match = [regex]::Match($header, 'filename="?([^";]+)"?')
+          if (-not $filename_match.Success) {
+            throw "Could not determine downloaded ZIP filename from Content-Disposition header: $header"
+          }
+          $filename = $filename_match.Groups[1].Value
           Write-Output $filename
           $response.Content | Set-Content -Path $filename -Force -AsByteStream
+          "The successful response body was saved as the UUP ZIP artifact: $filename" | Set-Content -Path .\debug-response\response-body-artifact.txt
           "filename=$filename" >> $env:GITHUB_OUTPUT
           
         shell: pwsh
+
+      - name: Upload response debug artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uup-response-debug
+          path: ./debug-response
+          if-no-files-found: warn
+          retention-days: 5
 
       - name: Upload UUP zip as artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.set_filename.outputs.filename }}
-          path: ${{ steps.set_filename.outputs.filename }}
+          path: ./${{ steps.set_filename.outputs.filename }}
           retention-days: 5
 
       - name: Unzip the downloaded file
         run: |
           ls
           ls >> $GITHUB_STEP_SUMMARY
-          Expand-Archive -Path ${{ steps.set_filename.outputs.filename }} -DestinationPath .\unzipped
+          Expand-Archive -Path "${{ steps.set_filename.outputs.filename }}" -DestinationPath .\unzipped
+          (Get-Content -Path .\unzipped\uup_download_windows.cmd) -replace 'powershell -NoProfile', 'pwsh -NoProfile' | Set-Content -Path .\unzipped\uup_download_windows.cmd
         shell: pwsh
 
-      - name: Run PowerShell script as Administrator
+      - name: Build ISO from UUP package
         id: get_iso
         run: |
+          New-Item -ItemType Directory -Path .\iso-metadata -Force | Out-Null
           ls
           ls .\unzipped
-          powershell cmd /c .\unzipped\uup_download_windows.cmd
+          Push-Location .\unzipped
+          cmd /c uup_download_windows.cmd
+          Pop-Location
           ls
           ls .\unzipped
-          $iso_name = ls .\unzipped\*.iso -Name
+          $iso = Get-ChildItem -Path .\unzipped -Filter *.iso -Recurse | Select-Object -First 1
+          if ($iso) {
+            $iso_name = $iso.Name
+            $iso_hash = Get-FileHash -Path $iso.FullName -Algorithm SHA256
+            [PSCustomObject]@{
+              iso_name = $iso.Name
+              iso_path = $iso.FullName
+              size_bytes = $iso.Length
+              sha256 = $iso_hash.Hash
+              uuid = "${{ github.event.inputs.uuid }}"
+              edition = "${{ github.event.inputs.edition }}"
+              uup_build_url = "${{ github.event.inputs.uup_build_url }}"
+              run_id = "${{ github.run_id }}"
+              run_attempt = "${{ github.run_attempt }}"
+            } | ConvertTo-Json -Depth 5 | Set-Content -Path .\iso-metadata\iso-metadata.json
+          } else {
+            $iso_name = "iso-files"
+            "No ISO files were found under .\unzipped." | Set-Content -Path .\iso-metadata\not-found.txt
+          }
           Write-Output $iso_name
           "isoname=$iso_name" >> $env:GITHUB_OUTPUT          
         shell: pwsh
 
-      - name: Upload ISO files as artifacts
+      - name: Upload ISO metadata artifact
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iso-metadata
+          path: ./iso-metadata
+          if-no-files-found: warn
+          retention-days: 5
+
+      - name: Upload ISO files as artifacts
+        if: steps.get_iso.outcome == 'success'
         uses: actions/upload-artifact@v4        
         with:
-          name: ${{ steps.get_iso.outputs.isoname }}
+          name: ${{ steps.get_iso.outputs.isoname || 'iso-files' }}
           path: ./unzipped/**/*.iso
+          if-no-files-found: error
           retention-days: 5        
 
       
